@@ -9,24 +9,48 @@ currently stands.
 
 ## Status, 2026-09-11
 
-The runtime prefills and generates end to end on the `runtime/deepseek41` branch. It has not been
-run on the real 510 GB weights yet, so treat the commands below as the shape of the recipe rather
-than a reproduced result.
+**It generates.** DeepSeek-V4.1-Flash Q2_K on one DGX Spark GB10, CPU backend:
+
+```
+prompt: "The chemical symbol for gold is"
+output: "The user is asking for the chemical symbol for gold. This"
+[ Prompt: 2.5 t/s | Generation: 2.3 t/s ]
+```
 
 | Stage | State |
 |---|---|
 | Convert safetensors to GGUF | Works |
-| Load a `deepseek41` GGUF, engram, hyper-connections | Works, verified against the reference |
-| Sparse attention, compressor, shared streams, indexer | Runs end to end on a synthetic model |
-| Generate on the real weights | Not yet run |
-| MTP head, vision | Present in the checkpoint, not mapped. Text only for now |
-| Two level candidate mask | Not implemented, see the context cap below |
+| Load, engram, hyper-connections | Works, verified against the reference |
+| Sparse attention, shared streams, indexer | Works |
+| Generate on the real weights | Works at Q2_K |
+| Quality measured against the reference | Not done, see below |
+| MTP head, vision | Present in the checkpoint, not mapped. Text only |
+| Two level candidate mask | Not implemented, see the context cap |
 
-What that means in practice: every component is implemented and the whole graph executes, and the
-remaining unknown is numerical agreement with the reference on real weights. The first run on the
-full model is the next milestone.
+Corpus NLL against the reference implementation has not been run, so the sample above is a smoke
+test rather than a quality claim.
 
-Track [vcruz305/llama.cpp `runtime/deepseek41`](https://github.com/vcruz305/llama.cpp/tree/runtime/deepseek41).
+## The published GGUFs need one repair first
+
+Files on the Hub were converted before two fixes landed, and both live in the header of the first
+shard of each rung.
+
+The engram keys were written with a hardcoded `deepseek4.` prefix while llama.cpp resolves every
+key as `{arch}.{key}`. That one is fixed on the Hub as of 2026-09-11.
+
+Five of the nine keys are still missing: `multipliers`, `primes`, `offsets`, `token_map` and
+`pad_id`. `gguf-py`'s `add_array()` maps every Python int to INT32, the hash multipliers are
+47-bit, so the write raised `struct.error` and a broad `except` turned that into one warning line.
+Until they are added the model will not load.
+
+```bash
+python scripts/fix_gguf_engram_kv.py     DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf     fixed/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf     --model-dir /path/to/DeepSeek-V4.1-Flash
+```
+
+It computes the constants from the checkpoint's tokenizer and config, re-emits every existing key
+byte for byte, and copies the tensor data untouched. Symlink the remaining shards alongside the
+output. Only the first shard of each rung carries file level metadata. The script is a no-op on a
+file converted after these fixes.
 
 | What | Where |
 |---|---|
@@ -75,10 +99,22 @@ compressed length passes `candidate_topk_blocks * candidate_block_size`, which i
 so below 16K it changes nothing and the runtime is exact without it. Above 16K it starts to matter
 and the second level is not implemented, so the cap is deliberate rather than a performance choice.
 
+### Use the CPU build for anything above ~100 GB
+
+A CUDA build pins host memory for CPU-resident weights, and pinned memory is capped by physical
+RAM. On a 121.7 GiB Spark, Q1_0 at 106 GB loads and Q2_K at 246 GB fails with
+`unable to allocate CUDA_Host buffer`. The CPU build uses plain mmap demand paging and handles it,
+which is what the Q2_K numbers above were measured on.
+
 ### Which rung fits
 
 The Spark has 121.7 GiB of unified memory, so the model does not fit whole at any rung and part of
-it streams. Q2_K at 246.3 GiB is the smallest published.
+it streams. **Start at Q2_K.** Q1_0 loads and runs, and emits the same token for every prompt: a
+1-bit block format keeps one scale per block and one sign bit per weight, so the token embedding
+table comes back as plus or minus a single magnitude per block. The embedding is the only place
+prompt identity enters the model, so once it is a sign vector the prompts are nearly
+indistinguishable. That rung is 1.53 bits per weight over the backbone, or 1.13 counting the
+engram tables.
 
 | Rung | Bytes | GiB |
 |---|---:|---:|
