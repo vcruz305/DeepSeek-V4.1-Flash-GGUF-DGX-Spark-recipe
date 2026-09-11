@@ -16,12 +16,15 @@ import gguf  # noqa: E402
 
 ARCH = "deepseek41"
 
-# tiny, but every relation the loader checks has to hold
-N_LAYER      = 4
+# Tiny, but every relation the loader checks has to hold. The head dims are not shrunk below 128:
+# the K rotation width search in llama_kv_cache starts at 64 and halves back, so a smaller head
+# yields a rotation wider than the head itself and llama_mul_mat_hadamard then reshapes to zero
+# rows at n_tokens 1. Real models are 512 and 128, so this only bites toy sizes.
+N_LAYER      = 6
 N_EMBD       = 64
 N_HEAD       = 4
-N_EMBD_HEAD  = 32           # head_dim, the latent KV width
-N_ROT        = 8            # rope_head_dim
+N_EMBD_HEAD  = 128          # head_dim, the latent KV width
+N_ROT        = 64           # rope_head_dim
 Q_LORA       = 16
 O_GROUPS     = 2
 O_LORA       = 8
@@ -31,9 +34,16 @@ N_EXPERT_USED= 2
 N_FF_EXP     = 32
 N_SHARED     = 1
 IDX_N_HEAD   = 2
-IDX_HEAD_DIM = 16
+IDX_HEAD_DIM = 128
 IDX_TOP_K    = 4
 N_VOCAB      = 320   # 3 special + 256 byte + 61 normal
+
+# layer roles, mirroring the real model's shape: a couple of sources publish a compressed stream
+# and the layers after each of them read it, at two different ratios
+COMPRESS_RATIOS   = [0, 0, 2, 2, 1, 1]
+KV_SOURCE_LAYERS  = [2, 4]      # these compress and publish
+INDEX_KEY_OWNERS  = [2, 4]      # these turn the latent into index keys
+INDEX_SOURCES     = [2, 4, 5]   # these run the indexer; 5 reads layer 4's keys
 
 ENGRAM_LAYERS   = [1]
 ENGRAM_KEY_LEN  = 8
@@ -80,10 +90,11 @@ def main(path):
     w.add_expert_weights_norm(True)
     w.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRTSOFTPLUS)
 
-    # per layer clamp arrays, and no compression anywhere in this file
+    # per layer clamp arrays
     w.add_key_value(f"{ARCH}.swiglu_clamp_exp", [7.0] * N_LAYER,
                     gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.FLOAT32)
-    w.add_key_value(f"{ARCH}.attention.compress_ratios", [0] * N_LAYER,
+    assert len(COMPRESS_RATIOS) == N_LAYER
+    w.add_key_value(f"{ARCH}.attention.compress_ratios", COMPRESS_RATIOS,
                     gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.INT32)
     w.add_key_value(f"{ARCH}.attention.compress_rope_freq_base", 10000.0,
                     gguf.GGUFValueType.FLOAT32)
@@ -190,6 +201,21 @@ def main(path):
         w.add_tensor(p + "ffn_down_shexp.weight", rnd(N_EMBD, N_FF_EXP * N_SHARED))
         w.add_tensor(p + "ffn_up_shexp.weight",   rnd(N_FF_EXP * N_SHARED, N_EMBD))
 
+        if il in KV_SOURCE_LAYERS:
+            w.add_tensor(p + "attn_compressor_kv.weight",   rnd(N_EMBD_HEAD, N_EMBD))
+            w.add_tensor(p + "attn_compressor_norm.weight", rnd(N_EMBD_HEAD))
+            # a layer that pools more than one token per row also carries the gate
+            if COMPRESS_RATIOS[il] > 1:
+                w.add_tensor(p + "attn_compressor_gate.weight", rnd(N_EMBD_HEAD, N_EMBD))
+
+        if il in INDEX_KEY_OWNERS:
+            w.add_tensor(p + "indexer.attn_k.weight", rnd(IDX_HEAD_DIM, N_EMBD_HEAD))
+            w.add_tensor(p + "indexer.k_norm.weight", rnd(IDX_HEAD_DIM))
+
+        if il in INDEX_SOURCES:
+            w.add_tensor(p + "indexer.attn_q_b.weight", rnd(IDX_N_HEAD * IDX_HEAD_DIM, Q_LORA))
+            w.add_tensor(p + "indexer.proj.weight",     rnd(IDX_N_HEAD, N_EMBD))
+
         if il in ENGRAM_LAYERS:
             w.add_tensor(p + "engram_embd.weight", rnd(n_rows, ENGRAM_KEY_LEN))
             w.add_tensor(p + "engram_wkv.weight",  rnd(N_EMBD * (HC_MULT + 1), N_COLS * ENGRAM_KEY_LEN))
@@ -200,7 +226,8 @@ def main(path):
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    print(f"wrote {path}: {N_LAYER} layers, engram on {ENGRAM_LAYERS}, engram table {n_rows} rows")
+    print(f"wrote {path}: {N_LAYER} layers, ratios {COMPRESS_RATIOS}, kv sources {KV_SOURCE_LAYERS}, "
+          f"index sources {INDEX_SOURCES}, engram on {ENGRAM_LAYERS}, engram table {n_rows} rows")
 
 
 if __name__ == "__main__":
