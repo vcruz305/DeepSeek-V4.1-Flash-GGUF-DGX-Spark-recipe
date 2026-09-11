@@ -16,22 +16,24 @@ import gguf  # noqa: E402
 
 ARCH = "deepseek41"
 
+# Tiny, but every relation the loader checks has to hold, and every quantizable tensor's ncols is
+# a multiple of 256 so the low-bit formats apply without a fallback.
 # Tiny, but every relation the loader checks has to hold. The head dims are not shrunk below 128:
 # the K rotation width search in llama_kv_cache starts at 64 and halves back, so a smaller head
 # yields a rotation wider than the head itself and llama_mul_mat_hadamard then reshapes to zero
 # rows at n_tokens 1. Real models are 512 and 128, so this only bites toy sizes.
 N_LAYER      = 6
-N_EMBD       = 64
+N_EMBD       = 256
 N_HEAD       = 4
 N_EMBD_HEAD  = 128          # head_dim, the latent KV width
 N_ROT        = 64           # rope_head_dim
-Q_LORA       = 16
+Q_LORA       = 128
 O_GROUPS     = 2
-O_LORA       = 8
+O_LORA       = 64
 HC_MULT      = 4
 N_EXPERT     = 4
 N_EXPERT_USED= 2
-N_FF_EXP     = 32
+N_FF_EXP     = 128
 N_SHARED     = 1
 IDX_N_HEAD   = 2
 IDX_HEAD_DIM = 128
@@ -46,7 +48,7 @@ INDEX_KEY_OWNERS  = [2, 4]      # these turn the latent into index keys
 INDEX_SOURCES     = [2, 4, 5]   # these run the indexer; 5 reads layer 4's keys
 
 ENGRAM_LAYERS   = [1]
-ENGRAM_KEY_LEN  = 8
+ENGRAM_KEY_LEN  = 128
 ENGRAM_MAX_NG   = 4
 ENGRAM_N_HEAD   = 2
 ENGRAM_PAD      = 1         # already through the token map, as the runtime expects
