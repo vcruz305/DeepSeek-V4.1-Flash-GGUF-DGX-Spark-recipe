@@ -30,18 +30,15 @@ output: "The user is asking for the chemical symbol for gold. This"
 Corpus NLL against the reference implementation has not been run, so the sample above is a smoke
 test rather than a quality claim.
 
-## The published GGUFs need one repair first
+## The published GGUFs are fixed as of 2026-09-11
 
-Files on the Hub were converted before two fixes landed, and both live in the header of the first
-shard of each rung.
+Files on the Hub were converted before two fixes landed, and both lived in the header of the first
+shard of each rung: the engram keys carried a hardcoded `deepseek4.` prefix, and five of the nine
+keys were missing entirely. Both are repaired on all five rungs now, so the files load as they are.
 
-The engram keys were written with a hardcoded `deepseek4.` prefix while llama.cpp resolves every
-key as `{arch}.{key}`. That one is fixed on the Hub as of 2026-09-11.
-
-Five of the nine keys are still missing: `multipliers`, `primes`, `offsets`, `token_map` and
-`pad_id`. `gguf-py`'s `add_array()` maps every Python int to INT32, the hash multipliers are
-47-bit, so the write raised `struct.error` and a broad `except` turned that into one warning line.
-Until they are added the model will not load.
+`scripts/fix_gguf_engram_kv.py` is kept for anyone holding an older copy. It re-emits every
+existing key byte for byte and copies tensor data untouched, and it is a no-op on a file converted
+after the fixes.
 
 ```bash
 python scripts/fix_gguf_engram_kv.py     DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf     fixed/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf     --model-dir /path/to/DeepSeek-V4.1-Flash
@@ -81,23 +78,37 @@ a slower path, so set it explicitly.
 ### Run
 
 ```bash
-./build/bin/llama-cli \
-    -m DeepSeek-V4.1-Flash-Q3_K_M.gguf \
-    -c 16384 -ngl 99 -t 16 \
-    -p "Explain the engram tables in one paragraph."
+./build/bin/llama-cli     -m DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf     -lm mmap -ngl 99 -cmoe -ot "engram_embd.weight=CPU"     -fa on -c 2048 -b 2048 -ub 1024 -t 20     -p "Explain in two sentences why a mixture of experts model activates only a few experts per token."
 ```
 
-```bash
-./build/bin/llama-server \
-    -m DeepSeek-V4.1-Flash-Q3_K_M.gguf \
-    -c 16384 -ngl 99 --host 0.0.0.0 --port 8080
+Measured on one DGX Spark GB10, Q2_K, 2026-09-11:
+
+| Config | Prompt | Generation |
+|---|---:|---:|
+| CPU build, no offload | 2.5 t/s | 2.3 t/s |
+| CUDA, `-cmoe`, tuned batch | 1.9 t/s | **2.8 t/s** |
+
+Sample output, temperature 0:
+
+```
+We need answer. Need explain why MoE activates only few experts per token. In two sentences.
+Need likely: computational efficiency, sparse gating, top-k routing. We can say: MoE uses a
+learned gating network that scores experts and routes each token to only top-k
 ```
 
-**Keep `-c` at or below 16384 for now.** V4.1 filters its compressed positions through a two level
-candidate mask. Measured against the reference, the first level selects every block until the
-compressed length passes `candidate_topk_blocks * candidate_block_size`, which is 2048 blocks of 8,
-so below 16K it changes nothing and the runtime is exact without it. Above 16K it starts to matter
-and the second level is not implemented, so the cap is deliberate rather than a performance choice.
+**`-lm mmap` is the flag that makes this work at all, and it is not optional on GB10.** The default
+load mode is `auto`, which disables mmap globally if any device reports no mmap support. The GB10
+CUDA device reports exactly that, so a 246 GB model tries to allocate 261 GB up front and fails
+with `unable to allocate CUDA_Host buffer`, or `CPU buffer` if you pass `--no-host`. Forcing
+`-lm mmap` restores demand paging and the offload then works.
+
+`-cmoe` keeps the mixture of experts weights on CPU and offloads the rest, and
+`-ot "engram_embd.weight=CPU"` keeps the two engram tables there too, since they are designed to be
+read from mmap on demand rather than held resident.
+
+The offload is worth having but it is not transformative, because the expert FFN dominates and
+stays on CPU either way. The real limit is that 246 GB against 121.7 GiB of unified memory is
+two-times oversubscribed, so throughput is bounded by paging rather than by compute.
 
 ### Use the CPU build for anything above ~100 GB
 
