@@ -9,19 +9,24 @@ currently stands.
 
 ## Status, 2026-09-11
 
-**Text generation does not work yet.** The runtime is most of the way there and the remaining piece
-is the sparse attention. Do not plan a deployment on this today.
+The runtime prefills and generates end to end on the `runtime/deepseek41` branch. It has not been
+run on the real 510 GB weights yet, so treat the commands below as the shape of the recipe rather
+than a reproduced result.
 
 | Stage | State |
 |---|---|
 | Convert safetensors to GGUF | Works |
-| Load a `deepseek41` GGUF, engram and hyper-connections | Works, verified against the reference |
-| Sparse attention | In progress on `runtime/deepseek41` |
-| Generate text | Blocked on the above |
+| Load a `deepseek41` GGUF, engram, hyper-connections | Works, verified against the reference |
+| Sparse attention, compressor, shared streams, indexer | Runs end to end on a synthetic model |
+| Generate on the real weights | Not yet run |
 | MTP head, vision | Present in the checkpoint, not mapped. Text only for now |
+| Two level candidate mask | Not implemented, see the context cap below |
 
-Watch [vcruz305/llama.cpp `runtime/deepseek41`](https://github.com/vcruz305/llama.cpp/tree/runtime/deepseek41).
-When that branch generates, this section says so and the commands below are the whole recipe.
+What that means in practice: every component is implemented and the whole graph executes, and the
+remaining unknown is numerical agreement with the reference on real weights. The first run on the
+full model is the next milestone.
+
+Track [vcruz305/llama.cpp `runtime/deepseek41`](https://github.com/vcruz305/llama.cpp/tree/runtime/deepseek41).
 
 | What | Where |
 |---|---|
@@ -102,7 +107,8 @@ Against DeepSeek-V4, which llama.cpp already supports:
 - **Hyper-connection lag**: each sublayer's mix coefficients are consumed by the *next* sublayer,
   so the last layer's FFN mix performs the final collapse and the model ships no `output_hc_*`.
 - **Sparse attention**: four KV source layers sharing one compressed stream, index keys derived
-  from that shared latent, and the two level candidate mask. This is the unfinished part.
+  from that shared latent, and a two level candidate mask. Everything but the candidate mask is
+  implemented.
 
 The architecture string is `deepseek41`. llama.cpp drops the `_v` (`deepseek_v2` became
 `deepseek2`, `deepseek_v3.2` became `deepseek32`), so `deepseek41` is the house style; vLLM's
@@ -178,7 +184,8 @@ rather than an underscore, and the tensor name strings are `attn_kv_a_norm`, `at
   weight per channel; doing it across channels instead is finite, plausible and wrong by 4.2.
 - **Indexer scaling identical** to V4's existing `1/sqrt(index_head_dim * n_heads)`.
 - **Graph structure confirmed** with `llama-eval-callback`: the layer 0 identity pre-mix, the one
-  sublayer lag, and a per-copy engram gate.
+  sublayer lag, a per-copy engram gate, and the full compressed path (pooled rows, index keys from
+  the pre-rope latent, the indexer top-k and the mask that carries it into attention).
 
 ## License
 
